@@ -1,5 +1,8 @@
+import re
+
 from datetime import datetime
 from decimal import Decimal
+from functools import partial
 
 from ipaddress import IPv4Address, IPv6Address
 
@@ -13,6 +16,8 @@ from .utils import parse_tsv
 DEFAULT_DDL_TIMEOUT = None
 DATE_NULL = '0000-00-00'
 DATETIME_NULL = '0000-00-00 00:00:00'
+
+EXTRACT_SUBTYPE_RE = re.compile(r'^[^\(]+\((.+)\)$')
 
 
 def date_converter(x):
@@ -30,6 +35,18 @@ def datetime_converter(x):
         return datetime.strptime(x, '%Y-%m-%d %H:%M:%S')
 
 
+def nullable_converter(subtype_str, x):
+    if x is None:
+        return None
+
+    converter = _get_type(subtype_str)
+    return converter(x) if converter else x
+
+
+def nothing_converter(x):
+    return None
+
+
 converters = {
     'Int8': int,
     'UInt8': int,
@@ -39,6 +56,10 @@ converters = {
     'UInt32': int,
     'Int64': int,
     'UInt64': int,
+    'Int128': int,
+    'UInt128': int,
+    'Int256': int,
+    'UInt256': int,
     'Float32': float,
     'Float64': float,
     'Decimal': Decimal,
@@ -47,6 +68,8 @@ converters = {
     'DateTime64': datetime_converter,
     'IPv4': IPv4Address,
     'IPv6': IPv6Address,
+    'Nullable': nullable_converter,
+    'Nothing': nothing_converter,
 }
 
 
@@ -54,8 +77,11 @@ def _get_type(type_str):
     result = converters.get(type_str)
     if result is not None:
         return result
-    if type_str.startswith('Decimal('):
+    if type_str.startswith('Decimal'):
         return converters['Decimal']
+    if type_str.startswith('Nullable('):
+        subtype_str = EXTRACT_SUBTYPE_RE.match(type_str).group(1)
+        return partial(converters['Nullable'], subtype_str)
     return None
 
 
@@ -64,19 +90,22 @@ class RequestsTransport(object):
     def __init__(
             self,
             db_url, db_name, username, password,
-            timeout=None, ch_settings=None, verify=None,
+            timeout=None, ch_settings=None,
             **kwargs):
 
         self.db_url = db_url
         self.db_name = db_name
         self.auth = (username, password)
         self.timeout = float(timeout) if timeout is not None else None
-        self.verify = verify
+        self.verify = kwargs.pop('verify', True)
+        self.cert = kwargs.pop('cert', None)
         self.headers = {
             key[8:]: value
             for key, value in kwargs.items()
             if key.startswith('header__')
         }
+
+        self.unicode_errors = kwargs.pop('unicode_errors', 'escape')
 
         ch_settings = dict(ch_settings or {})
         self.ch_settings = ch_settings
@@ -85,8 +114,9 @@ class RequestsTransport(object):
         if ddl_timeout is not None:
             self.ch_settings['distributed_ddl_task_timeout'] = int(ddl_timeout)
 
-        # Keep connection open between queries.
-        self.http = requests.Session()
+        # By default, keep connection open between queries.
+        http = kwargs.pop('http_session', requests.Session)
+        self.http = http() if callable(http) else http
 
         super(RequestsTransport, self).__init__()
 
@@ -98,8 +128,8 @@ class RequestsTransport(object):
         r = self._send(query, params=params, stream=True)
         lines = r.iter_lines()
         try:
-            names = parse_tsv(next(lines))
-            types = parse_tsv(next(lines))
+            names = parse_tsv(next(lines), self.unicode_errors)
+            types = parse_tsv(next(lines), self.unicode_errors)
         except StopIteration:
             # Empty result; e.g. a DDL request.
             return
@@ -111,8 +141,8 @@ class RequestsTransport(object):
 
         for line in lines:
             yield [
-                (converter(x) if converter else x)
-                for x, converter in zip(parse_tsv(line), convs)
+                (conv(x) if conv else x)
+                for x, conv in zip(parse_tsv(line, self.unicode_errors), convs)
             ]
 
     def raw(self, query, params=None, stream=False):
@@ -136,7 +166,7 @@ class RequestsTransport(object):
         r = self.http.post(
             self.db_url, auth=self.auth, params=params, data=data,
             stream=stream, timeout=self.timeout, headers=self.headers,
-            verify=self.verify,
+            verify=self.verify, cert=self.cert
         )
         if r.status_code != 200:
             orig = HTTPException(r.text)
